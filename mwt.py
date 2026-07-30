@@ -17,7 +17,7 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 APP_NAME = "ＭWT遊戲視窗調整工具"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
