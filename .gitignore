@@ -16,6 +16,7 @@ build/
 .idea/
 .vscode/
 .cursor/
+CONTRIBUTING.md
 *.swp
 *~
 Thumbs.db
