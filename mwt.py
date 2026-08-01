@@ -16,8 +16,8 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
-APP_NAME = "ＭWT遊戲視窗調整工具"
-APP_VERSION = "1.1"
+APP_NAME = "MWT遊戲視窗調整工具"
+APP_VERSION = "1.2"
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -53,13 +53,10 @@ DEFAULT_DPI = 96
 
 # NotifyIcon (system tray) constants
 NIM_ADD = 0
-NIM_MODIFY = 1
 NIM_DELETE = 2
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
 NIF_TIP = 0x04
-NIF_INFO = 0x10
-NIIF_INFO = 0x01
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
 WM_NULL = 0x0000
@@ -87,6 +84,8 @@ APP_USER_MODEL_ID = "MWT.GameWindowTool.App"
 
 # Poll interval (ms): responsive enough for aspect correction, light on the game
 TICK_MS = 200
+# Auto-discover new windows ~once per second (5 × TICK_MS)
+DISCOVER_EVERY_N_TICKS = 5
 # Size match slack so 1–2 px frame rounding does not trigger endless re-apply
 TOLERANCE = 2
 
@@ -407,8 +406,8 @@ def looks_like_game(
     return False
 
 
-def enum_top_level_windows(show_all: bool = False) -> list[dict]:
-    """Enumerate top-level windows for the target combo.
+def _collect_candidate_windows(show_all: bool = False) -> list[dict]:
+    """Enumerate visible candidate windows (no snapshot side effects).
 
     By default only likely game windows are returned (prioritized). When
     show_all is True, other visible windows above MIN_LISTED_SIZE are included.
@@ -440,13 +439,9 @@ def enum_top_level_windows(show_all: bool = False) -> list[dict]:
                 return True
             if width < MIN_LISTED_SIZE[0] or height < MIN_LISTED_SIZE[1]:
                 return True
-        hwnd_i = int(hwnd)
-        # Snapshot as soon as a likely game window is seen
-        if game:
-            capture_native_snapshot(hwnd_i)
         found.append(
             {
-                "hwnd": hwnd_i,
+                "hwnd": int(hwnd),
                 "title": title,
                 "class": class_name,
                 "pid": pid,
@@ -468,6 +463,30 @@ def enum_top_level_windows(show_all: bool = False) -> list[dict]:
     # Prefer game-like windows so the default selection is usually correct
     found.sort(key=lambda item: not item["game"])
     return found
+
+
+def enum_top_level_windows(show_all: bool = False) -> list[dict]:
+    """Enumerate top-level windows for the target combo and snapshot each."""
+    found = _collect_candidate_windows(show_all)
+    for item in found:
+        capture_native_snapshot(item["hwnd"])
+    return found
+
+
+def discover_and_snapshot_windows(show_all: bool = False) -> list[dict]:
+    """Snapshot candidates that have no valid first-seen state yet.
+
+    Returns only windows that newly received a snapshot (for quiet UI updates).
+    Does not overwrite existing same-HWND+PID snapshots.
+    """
+    newly: list[dict] = []
+    for item in _collect_candidate_windows(show_all):
+        hwnd = item["hwnd"]
+        if peek_native_snapshot(hwnd) is not None:
+            continue
+        if capture_native_snapshot(hwnd) is not None:
+            newly.append(item)
+    return newly
 
 
 def direct_children(parent: int) -> list[int]:
@@ -584,9 +603,10 @@ def peek_native_snapshot(
 def capture_native_snapshot(
     hwnd: int,
 ) -> tuple[int, int, int, int, int, int, int, int, int] | None:
-    """Record native state on intentional sighting (enum / select / mutate).
+    """Record native state on intentional sighting (enum / discover / select / mutate).
 
-    UI polling must use peek_native_snapshot only. If a stale HWND entry
+    Routine UI polling must use peek_native_snapshot only; discovery may call
+    this for HWNDs that still lack a valid snapshot. If a stale HWND entry
     belongs to another PID, drop it and record the current window instead.
     """
     existing = _native_snapshot.get(hwnd)
@@ -860,21 +880,6 @@ class TrayIcon:
             pass
         return int(user32.LoadIconW(None, IDI_APPLICATION) or 0)
 
-    def notify(self, title: str, text: str) -> None:
-        """Show a balloon tip on the tray icon."""
-        data = self._data
-        if data is None:
-            return
-        data.uFlags = NIF_INFO
-        data.szInfoTitle = title[:63]
-        data.szInfo = text[:255]
-        data.dwInfoFlags = NIIF_INFO
-        try:
-            shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data))
-        except OSError:
-            pass
-        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-
     def _note_tray_event(self, event: int) -> None:
         """Map WM_* click codes to a pending action for the Tk thread."""
         if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
@@ -985,9 +990,9 @@ class App(tk.Tk):
         self._drag_start: tuple[int, int] | None = None
         self._drag_last: tuple[int, int] | None = None
         self._tick_job: str | None = None
+        self._discover_tick = 0
         self._tray: TrayIcon | None = None
         self._pump_job: str | None = None
-        self._tray_hinted = False
 
         self._build_ui()
         self.refresh_windows()
@@ -1192,13 +1197,17 @@ class App(tk.Tk):
             return None
         return hwnd
 
-    def refresh_windows(self) -> None:
-        """Re-enumerate windows and reset the current mode selection."""
-        self.windows = enum_top_level_windows(show_all=self.show_all.get())
-        labels = [
+    def _window_labels(self) -> list[str]:
+        """Combo labels for the current windows list."""
+        return [
             f'{item["title"][:32]} · {item["exe"] or "?"} · {item["cw"]}x{item["ch"]}'
             for item in self.windows
         ]
+
+    def refresh_windows(self) -> None:
+        """Re-enumerate windows and reset the current mode selection."""
+        self.windows = enum_top_level_windows(show_all=self.show_all.get())
+        labels = self._window_labels()
         self.win_combo["values"] = labels
         self._reset_mode()
         if labels:
@@ -1209,6 +1218,19 @@ class App(tk.Tk):
             self.win_var.set("")
             self.info_var.set("找不到遊戲視窗，請先開啟遊戲後重新整理，或勾選「列出所有視窗」")
             self.status_var.set("未找到視窗")
+
+    def _quiet_refresh_windows(self) -> None:
+        """Fill an empty combo after auto-discover without clearing mode state."""
+        self.windows = enum_top_level_windows(show_all=self.show_all.get())
+        labels = self._window_labels()
+        self.win_combo["values"] = labels
+        if labels:
+            self.win_combo.current(0)
+            self._update_info()
+            self.status_var.set(f"已自動發現 {len(labels)} 個視窗")
+        else:
+            self.win_var.set("")
+            self.info_var.set("找不到遊戲視窗，請先開啟遊戲後重新整理，或勾選「列出所有視窗」")
 
     def _update_info(self) -> None:
         """Refresh the hint line under the window combo (size/pos/native)."""
@@ -1231,7 +1253,10 @@ class App(tk.Tk):
                 f"畫面 {cw} × {ch}　位置 ({x}, {y})　原始 {nw}×{nh}（{aspect}）"
             )
         else:
-            self.info_var.set(f"畫面 {cw} × {ch}　位置 ({x}, {y})")
+            self.info_var.set(
+                f"畫面 {cw} × {ch}　位置 ({x}, {y})　"
+                "尚未記錄原始狀態（請等待偵測或重新整理）"
+            )
         self.mode_var.set(MODE_LABELS.get(self._mode, MODE_LABELS[None]))
 
     def _sync_option_states(self) -> None:
@@ -1467,7 +1492,18 @@ class App(tk.Tk):
         self._tick_job = self.after(TICK_MS, self._tick)
 
     def _tick_body(self) -> None:
-        """One poll iteration: refresh UI hints, then maintain the active mode."""
+        """One poll iteration: discover, refresh UI hints, then maintain mode."""
+        self._discover_tick += 1
+        if self._discover_tick >= DISCOVER_EVERY_N_TICKS:
+            self._discover_tick = 0
+            newly = discover_and_snapshot_windows(show_all=self.show_all.get())
+            if (
+                newly
+                and not self.windows
+                and self._mode is None
+                and any(item["game"] for item in newly)
+            ):
+                self._quiet_refresh_windows()
         self._update_info()
         self._sync_option_states()
         if self._mode is None:
@@ -1583,12 +1619,6 @@ class App(tk.Tk):
             return
         self.withdraw()
         self._pump()
-        if not self._tray_hinted:
-            self._tray_hinted = True
-            self._tray.notify(
-                "仍在背景執行",
-                "置頂與自動維持繼續生效。雙擊圖示可開回視窗，右鍵可結束。",
-            )
 
     def show_from_tray(self) -> None:
         """Restore the main window from the tray icon."""
