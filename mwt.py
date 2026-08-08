@@ -17,7 +17,7 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 APP_NAME = "MWT遊戲視窗調整工具"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -59,9 +59,11 @@ NIF_ICON = 0x02
 NIF_TIP = 0x04
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
+WM_TRAY_SHOWMENU = WM_APP + 2
 WM_NULL = 0x0000
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_CONTEXTMENU = 0x007B
 PM_REMOVE = 0x0001
@@ -70,6 +72,7 @@ TPM_RETURNCMD = 0x0100
 MF_STRING = 0x0000
 WS_EX_TOOLWINDOW = 0x00000080
 GWLP_WNDPROC = -4
+HWND_TOP = 0
 IDI_APPLICATION = 32512
 WM_SETICON = 0x0080
 ICON_SMALL = 0
@@ -293,7 +296,15 @@ user32.TrackPopupMenu.restype = ctypes.c_uint
 user32.DestroyMenu.argtypes = [w.HMENU]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
 user32.SetForegroundWindow.argtypes = [w.HWND]
+user32.SetForegroundWindow.restype = w.BOOL
+user32.BringWindowToTop.argtypes = [w.HWND]
+user32.BringWindowToTop.restype = w.BOOL
+user32.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
+user32.AttachThreadInput.restype = w.BOOL
+user32.GetWindowThreadProcessId.restype = w.DWORD
+kernel32.GetCurrentThreadId.restype = w.DWORD
 user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+user32.PostMessageW.restype = w.BOOL
 # LRESULT is 64-bit on x64; keep WNDPROC refs on the instance to avoid GC
 _LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
 WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
@@ -862,6 +873,9 @@ class TrayIcon:
         if msg == WM_TRAY:
             self._note_tray_event(int(lparam) & 0xFFFF)
             return 0
+        if msg == WM_TRAY_SHOWMENU:
+            self._pending = TRAY_ACTION_MENU
+            return 0
         if self._old_wndproc:
             return user32.CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
         return 0
@@ -884,24 +898,58 @@ class TrayIcon:
         """Map WM_* click codes to a pending action for the Tk thread."""
         if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
             self._pending = TRAY_ACTION_SHOW
-        elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
-            self._pending = TRAY_ACTION_MENU
+        elif event in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU):
+            # Defer menu so the notification overflow flyout can dismiss first
+            if self._hwnd is not None:
+                user32.PostMessageW(self._hwnd, WM_TRAY_SHOWMENU, 0, 0)
+
+    @staticmethod
+    def _force_foreground(hwnd: int) -> None:
+        """Attach to the foreground thread so TrackPopupMenu can take focus."""
+        fg = int(user32.GetForegroundWindow() or 0)
+        cur_thread = int(kernel32.GetCurrentThreadId())
+        fg_thread = int(user32.GetWindowThreadProcessId(fg, None)) if fg else 0
+        attached = False
+        if fg_thread and fg_thread != cur_thread:
+            attached = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetWindowPos(
+                hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_thread, fg_thread, False)
 
     def pump(self) -> None:
         """Drain tray messages and run any pending show/menu action.
 
         Explorer usually PostMessages; Tk does not dispatch foreign HWNDs, so
         we Peek ourselves. Cross-process SendMessage hits WndProc during Peek.
-        Both paths converge on _pending.
+        Both paths converge on _pending. Right-click menus are posted as
+        WM_TRAY_SHOWMENU and shown on the next pump when possible.
         """
         if self._hwnd is None:
             return
         msg = w.MSG()
+        # If right-click posts SHOWMENU in this same Peek drain, re-post it so
+        # the shell overflow panel can close before TrackPopupMenu runs.
+        defer_menu = False
         while user32.PeekMessageW(
             ctypes.byref(msg), w.HWND(self._hwnd), 0, 0, PM_REMOVE
         ):
             if msg.message == WM_TRAY:
-                self._note_tray_event(int(msg.lParam) & 0xFFFF)
+                event = int(msg.lParam) & 0xFFFF
+                if event in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU):
+                    defer_menu = True
+                self._note_tray_event(event)
+            elif msg.message == WM_TRAY_SHOWMENU:
+                if defer_menu:
+                    user32.PostMessageW(self._hwnd, WM_TRAY_SHOWMENU, 0, 0)
+                else:
+                    self._pending = TRAY_ACTION_MENU
             elif self._old_wndproc:
                 user32.CallWindowProcW(
                     self._old_wndproc, msg.hwnd, msg.message, msg.wParam, msg.lParam
@@ -927,7 +975,7 @@ class TrayIcon:
             pos = w.POINT()
             user32.GetCursorPos(ctypes.byref(pos))
             # Hidden owners must take foreground or the menu will not dismiss
-            user32.SetForegroundWindow(self._hwnd)
+            self._force_foreground(self._hwnd)
             choice = int(
                 user32.TrackPopupMenu(
                     menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pos.x, pos.y, 0,
