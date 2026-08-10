@@ -17,7 +17,7 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 APP_NAME = "MWT遊戲視窗調整工具"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -53,6 +53,7 @@ DEFAULT_DPI = 96
 
 # NotifyIcon (system tray) constants
 NIM_ADD = 0
+NIM_MODIFY = 1
 NIM_DELETE = 2
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
@@ -66,6 +67,9 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_CONTEXTMENU = 0x007B
+WM_POWERBROADCAST = 0x0218
+PBT_APMRESUMEAUTOMATIC = 0x0012
+PBT_APMRESUMESUSPEND = 0x0007
 PM_REMOVE = 0x0001
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
@@ -84,6 +88,11 @@ TRAY_CMD_QUIT = 2
 TRAY_ACTION_SHOW = "show"
 TRAY_ACTION_MENU = "menu"
 APP_USER_MODEL_ID = "MWT.GameWindowTool.App"
+
+
+def tray_refresh_operations(modify_succeeds: bool) -> tuple[int, ...]:
+    """Return shell operations used to recover a notification icon."""
+    return (NIM_MODIFY,) if modify_succeeds else (NIM_MODIFY, NIM_ADD)
 
 # Poll interval (ms): responsive enough for aspect correction, light on the game
 TICK_MS = 200
@@ -305,6 +314,8 @@ user32.GetWindowThreadProcessId.restype = w.DWORD
 kernel32.GetCurrentThreadId.restype = w.DWORD
 user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 user32.PostMessageW.restype = w.BOOL
+user32.RegisterWindowMessageW.argtypes = [w.LPCWSTR]
+user32.RegisterWindowMessageW.restype = w.UINT
 # LRESULT is 64-bit on x64; keep WNDPROC refs on the instance to avoid GC
 _LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
 WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
@@ -823,6 +834,10 @@ class TrayIcon:
         self._pending: str | None = None
         self._wndproc = None
         self._old_wndproc = 0
+        self._taskbar_created = int(
+            user32.RegisterWindowMessageW("TaskbarCreated") or 0
+        )
+        self._registered = False
 
     @property
     def alive(self) -> bool:
@@ -851,18 +866,9 @@ class TrayIcon:
                 )
             )
             self._icon = self._load_icon()
-            data = NOTIFYICONDATAW()
-            data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-            data.hWnd = self._hwnd
-            data.uID = 1
-            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-            data.uCallbackMessage = WM_TRAY
-            data.hIcon = self._icon
-            data.szTip = self._tip[:127]
-            if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
+            if not self._register_icon(NIM_ADD):
                 self.destroy()
                 return False
-            self._data = data
             return True
         except OSError:
             self.destroy()
@@ -870,6 +876,15 @@ class TrayIcon:
 
     def _window_proc(self, hwnd, msg, wparam, lparam):
         """Subclassed WndProc: record tray clicks, forward everything else."""
+        if msg == self._taskbar_created:
+            self._registered = False
+            self._register_icon(NIM_ADD)
+            return 0
+        if msg == WM_POWERBROADCAST and wparam in (
+            PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+        ):
+            self._refresh_icon()
+            return 1
         if msg == WM_TRAY:
             self._note_tray_event(int(lparam) & 0xFFFF)
             return 0
@@ -879,6 +894,34 @@ class TrayIcon:
         if self._old_wndproc:
             return user32.CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
         return 0
+
+    def _register_icon(self, operation: int) -> bool:
+        """Add or refresh the shell icon after Explorer/display recovery."""
+        if self._hwnd is None:
+            return False
+        data = self._data or NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = self._hwnd
+        data.uID = 1
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        data.uCallbackMessage = WM_TRAY
+        data.hIcon = self._icon
+        data.szTip = self._tip[:127]
+        try:
+            ok = bool(shell32.Shell_NotifyIconW(operation, ctypes.byref(data)))
+        except OSError:
+            ok = False
+        if ok:
+            self._data = data
+            self._registered = True
+        return ok
+
+    def _refresh_icon(self) -> bool:
+        """Refresh an existing icon, falling back to add after shell recovery."""
+        if self._register_icon(NIM_MODIFY):
+            return True
+        self._registered = False
+        return self._register_icon(NIM_ADD)
 
     def _load_icon(self) -> int:
         """Prefer mushroom.ico; fall back to the exe-embedded or default icon."""
@@ -937,23 +980,29 @@ class TrayIcon:
         # If right-click posts SHOWMENU in this same Peek drain, re-post it so
         # the shell overflow panel can close before TrackPopupMenu runs.
         defer_menu = False
-        while user32.PeekMessageW(
-            ctypes.byref(msg), w.HWND(self._hwnd), 0, 0, PM_REMOVE
-        ):
-            if msg.message == WM_TRAY:
-                event = int(msg.lParam) & 0xFFFF
-                if event in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU):
-                    defer_menu = True
-                self._note_tray_event(event)
-            elif msg.message == WM_TRAY_SHOWMENU:
-                if defer_menu:
-                    user32.PostMessageW(self._hwnd, WM_TRAY_SHOWMENU, 0, 0)
-                else:
-                    self._pending = TRAY_ACTION_MENU
-            elif self._old_wndproc:
-                user32.CallWindowProcW(
-                    self._old_wndproc, msg.hwnd, msg.message, msg.wParam, msg.lParam
-                )
+        try:
+            while user32.PeekMessageW(
+                ctypes.byref(msg), w.HWND(self._hwnd), 0, 0, PM_REMOVE
+            ):
+                if msg.message == WM_TRAY:
+                    event = int(msg.lParam) & 0xFFFF
+                    if event in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU):
+                        defer_menu = True
+                    self._note_tray_event(event)
+                elif msg.message == WM_TRAY_SHOWMENU:
+                    if defer_menu:
+                        user32.PostMessageW(self._hwnd, WM_TRAY_SHOWMENU, 0, 0)
+                    else:
+                        self._pending = TRAY_ACTION_MENU
+                elif self._old_wndproc:
+                    user32.CallWindowProcW(
+                        self._old_wndproc, msg.hwnd, msg.message, msg.wParam, msg.lParam
+                    )
+        except OSError:
+            # A display/Explorer transition can invalidate one shell callback;
+            # keep the Tk pump alive and let TaskbarCreated re-register it.
+            self._registered = False
+            self._refresh_icon()
         action = self._pending
         self._pending = None
         if action == TRAY_ACTION_SHOW:
@@ -998,6 +1047,7 @@ class TrayIcon:
             except OSError:
                 pass
             self._data = None
+            self._registered = False
         if self._hwnd is not None:
             if self._old_wndproc:
                 try:
@@ -1021,6 +1071,11 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
+        # Keep the adjustment tool above the game while it is visible.  Tk's
+        # topmost flag is cleared while minimized/hidden and restored on Map.
+        self.attributes("-topmost", True)
+        self.bind("<Unmap>", self._on_ui_unmap, add="+")
+        self.bind("<Map>", self._on_ui_map, add="+")
         self._hicon_big = 0
         self._hicon_small = 0
         self._apply_app_icon()
@@ -1048,6 +1103,21 @@ class App(tk.Tk):
         self._fit_to_content()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._tick()
+
+    def _on_ui_unmap(self, _event=None) -> None:
+        """Stop forcing the tool above other windows while minimized/hidden."""
+        try:
+            self.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    def _on_ui_map(self, _event=None) -> None:
+        """Restore tool topmost state when it becomes visible again."""
+        try:
+            if self.state() == "normal":
+                self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
 
     def _apply_app_icon(self) -> None:
         """Set title-bar/taskbar icons; Tk's default feather overrides the exe icon."""
@@ -1201,7 +1271,7 @@ class App(tk.Tk):
         group.columnconfigure(1, weight=1)
 
         self.keep_ratio = tk.BooleanVar(value=False)
-        self.cover_taskbar = tk.BooleanVar(value=True)
+        self.cover_taskbar = tk.BooleanVar(value=False)
         self.watch_var = tk.BooleanVar(value=False)
         self.minimize_to_tray = tk.BooleanVar(value=True)
 
